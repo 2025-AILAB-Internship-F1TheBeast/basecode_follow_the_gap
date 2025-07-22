@@ -1,0 +1,86 @@
+# Compiled Object files
+*.o
+*.obj
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Compiled Static libraries
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+
+# Debug Symbols (macOS)
+*.dSYM/
+*.dSYM
+
+# Executables (no extension) - project specific
+
+# Build directories
+build/
+bin/
+obj/
+out/
+**/build/
+**/install/
+**/target/
+
+# Data directories
+data/
+**/data/
+
+# Log files
+**/log/
+*.log
+
+# IDE files
+.vscode/
+*.vscode
+.idea/
+*.xcodeproj/
+*.xcworkspace/
+
+# System files
+.DS_Store
+*.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+*~
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# Autotools
+*.in
+configure
+config.log
+config.status
+autom4te.cache/
+
+# Rust/Cargo (if mixed project)
+*.cargo
+*.lock
+Cargo.lock
+
+# Python (if mixed project)
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pth
+.Python
+.venv/
+venv/
+*.egg-info/
