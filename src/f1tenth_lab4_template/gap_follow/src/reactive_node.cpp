@@ -2,6 +2,7 @@
 #include "nav_msgs/msg/odometry.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/laser_scan.hpp"
+#include "visualization_msgs/msg/marker.hpp"
 #include <algorithm>
 #include <cmath>
 #include <iostream>
@@ -23,6 +24,8 @@ class ReactiveFollowGap : public rclcpp::Node
         scan_subscription_ = this->create_subscription<sensor_msgs::msg::LaserScan>(
             lidarscan_topic, 10, std::bind(&ReactiveFollowGap::lidar_callback, this, std::placeholders::_1));
 
+        marker_publisher_ = this->create_publisher<visualization_msgs::msg::Marker>("best_point_marker", 1);
+
         RCLCPP_INFO(this->get_logger(), "ReactiveFollowGap node initialized");
     }
 
@@ -33,11 +36,16 @@ class ReactiveFollowGap : public rclcpp::Node
     /// TODO: create ROS subscribers and publishers
     rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_subscription_;
     rclcpp::Publisher<ackermann_msgs::msg::AckermannDriveStamped>::SharedPtr drive_publisher_;
+    rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr marker_publisher_;
 
     // Additional member variables for algorithm state
     std::optional<size_t> previous_best_point_;
     float angle_increment_;
     size_t ranges_size_;
+
+    // PID 관련 멤버 변수
+    float pid_integral_ = 0.0f;
+    float pid_prev_error_ = 0.0f;
 
     void preprocess_lidar(float *ranges)
     {
@@ -53,12 +61,15 @@ class ReactiveFollowGap : public rclcpp::Node
         size_t min_idx = 0;
 
         // Find minimum distance and clamp invalid values
+        // ranges_size_ = 1080
         for (size_t i = 0; i < ranges_size_; ++i)
         {
+            // max_range보다 크거나, NaN, Inf인 값은 max_range로 설정
             if (ranges[i] > max_range || std::isnan(ranges[i]) || std::isinf(ranges[i]))
             {
                 ranges[i] = max_range;
             }
+            // min_dist보다 작고 0.0f보다 큰 range는 min_dist로 설정
             else if (ranges[i] < min_dist && ranges[i] > 0.0f)
             {
                 min_dist = ranges[i];
@@ -94,7 +105,9 @@ class ReactiveFollowGap : public rclcpp::Node
         size_t roi_angle_steps = static_cast<size_t>(roi_angle_rad / angle_increment_);
 
         size_t mid_lidar_idx = ranges_size_ / 2;
+        // 관심 영역의 시작 인덱스를 계산
         size_t roi_idx_start = (mid_lidar_idx >= roi_angle_steps) ? mid_lidar_idx - roi_angle_steps : 0;
+        // 관심 영역의 끝 인덱스를 계산
         size_t roi_idx_end = std::min(mid_lidar_idx + roi_angle_steps, ranges_size_ - 1);
 
         // Find the largest gap in free space
@@ -152,7 +165,8 @@ class ReactiveFollowGap : public rclcpp::Node
         // Return indices through pointer parameters
         indice[0] = static_cast<int>(max_gap_start);
         indice[1] = static_cast<int>(max_gap_end);
-
+        // std::cout << "Max gap start : " << max_gap_start << std::endl;
+        // std::cout << "Max gap end : " << max_gap_end << std::endl;
         return;
     }
 
@@ -216,13 +230,40 @@ class ReactiveFollowGap : public rclcpp::Node
         return std::atan2(2.0f * wheel_base * std::sin(lookahead_angle), lookahead_rear);
     }
 
+    // 현재(250724) 코드는 best point 한 개만 구해서 그 값을 따라가게끔 하는 구조임.
+    // Pure pursuit는 구현이 가능하지만, 현재 단계에서는 Stanley 구현 불가
+    // 따라서, waypoint가 2개 주어졌다고 가정하고 뒤쪽의 waypoint를 따라가는 구조로 구현
+    float stanley(float car_velocity, float waypoint_x1, float waypoint_y1, float waypoint_x2, float waypoint_y2)
+    {
+        const float k = 0.5f; // Stanley controller gain
+        const float wheel_base = 0.32f;
+        const float x_front = 0.05f;
+        const float y_front = 0.0f;
+        
+        float track_error = point_to_line_distance(waypoint_x1, waypoint_y1, waypoint_x2, waypoint_y2, x_front, y_front);
+        float heading_error = std::atan2(waypoint_y2 - waypoint_y1, waypoint_x2 - waypoint_x1) - std::atan2(y_front, x_front);
+        float steering_angle = heading_error + std::atan2(k * track_error, car_velocity);
+        return steering_angle;
+    }
+
+    // 점과 직선 사이의 거리 구하는 공식
+    float point_to_line_distance(float x1, float y1, float x2, float y2, float px, float py)
+    {
+        float numerator = std::abs((y2 - y1) * px - (x2 - x1) * py + x2 * y1 - y2 * x1);
+        float denominator = std::sqrt(std::pow(y2 - y1, 2) + std::pow(x2 - x1, 2));
+        return numerator / denominator;
+    }
+
+    // 차량 제어 파트
     std::pair<float, float> vehicle_control(float *ranges, size_t best_point)
     {
         // Calculate steering angle and speed
-        size_t vehicle_center_idx = ranges_size_ / 2;
-        float steer_ang_rad =
-            (static_cast<float>(best_point) - static_cast<float>(vehicle_center_idx)) * angle_increment_;
-
+        // 차량의 중심 인덱스를 기준으로 
+        size_t vehicle_center_idx = ranges_size_ / 2;   // 540
+        // Calculate steering angle in radians
+        // steer_ang_rad는 차량의 x축을 기준으로 best_point가 몇 rad 떨어져있는지 각도를 계산한 값
+        // Pure pursuit에서 알파값에 해당함.
+        float steer_ang_rad = (static_cast<float>(best_point) - static_cast<float>(vehicle_center_idx)) * angle_increment_;
         float best_lookahead = std::min(ranges[best_point], 3.0f);
         float steer_ang_deg = std::abs(steer_ang_rad) * 180.0f / M_PI;
 
@@ -237,10 +278,12 @@ class ReactiveFollowGap : public rclcpp::Node
         else
             adaptive_lookahead = best_lookahead * 0.3f;
 
+        // pure_pursuit_steer 변수는 Pure pursuit 알고리즘에서 delta 즉, 차량의 스티어링 회전 값을 의미.
         float pure_pursuit_steer = pure_pursuit(steer_ang_rad, adaptive_lookahead);
+        // float stanley_steer = stanley();
         float final_steer_ang_deg = std::abs(pure_pursuit_steer) * 180.0f / M_PI;
 
-        // Speed control based on steering angle (Fast Speed profile)
+        // 하드코딩으로 linear_velocity를 설정
         float drive_speed;
         if (final_steer_ang_deg < 5.0f)
             drive_speed = 4.0f;
@@ -251,9 +294,68 @@ class ReactiveFollowGap : public rclcpp::Node
         else
             drive_speed = 0.8f;
 
+        // PID 컨트롤러로 속도 조절
+        // drive_speed = pid_controller(drive_speed, current_speed);
+
         RCLCPP_INFO(this->get_logger(), "Final Steer: %.2f°, Driving Speed: %.2f", final_steer_ang_deg, drive_speed);
 
         return std::make_pair(pure_pursuit_steer, drive_speed);
+    }
+
+    // PID 컨트롤러 함수: 목표 속도와 현재 속도를 받아 linear speed를 반환
+    // 자세히 확인하고 다시 적용할 것. 뭔가 잘못된 부분이 있는 것 같음.
+    float pid_controller(float target_speed, float current_speed)
+    {
+        // PID 파라미터 (상황에 맞게 튜닝)
+        const float Kp = 1.0f;
+        const float Ki = 0.1f;
+        const float Kd = 0.05f;
+
+        float error = target_speed - current_speed;
+        pid_integral_ += error;
+        float derivative = error - pid_prev_error_;
+        pid_prev_error_ = error;
+
+        float output_speed = Kp * error + Ki * pid_integral_ + Kd * derivative + current_speed;
+        // 속도 제한 (예: 0~4 m/s)
+        output_speed = std::max(0.0f, std::min(output_speed, 4.0f));
+
+        return output_speed;
+    }
+
+    // Publish the best point marker in RViz
+    // This function visualizes the best point in the gap as a red sphere marker
+    void publish_best_point_marker(size_t best_point_idx, float *ranges)
+    {
+        visualization_msgs::msg::Marker marker;
+        marker.header.frame_id = "ego_racecar/laser"; // LiDAR 좌표계에 맞게 설정
+        marker.header.stamp = this->now();
+        marker.ns = "best_point";
+        marker.id = 0;
+        marker.type = visualization_msgs::msg::Marker::SPHERE;
+        marker.action = visualization_msgs::msg::Marker::ADD;
+
+        // best_point의 위치 계산
+        float range = ranges[best_point_idx];
+        float angle = (static_cast<float>(best_point_idx) - static_cast<float>(ranges_size_ / 2)) * angle_increment_;
+
+        marker.pose.position.x = range * std::cos(angle);
+        marker.pose.position.y = range * std::sin(angle);
+        marker.pose.position.z = 0.0;
+        marker.pose.orientation.w = 1.0;
+
+        marker.scale.x = 0.2;
+        marker.scale.y = 0.2;
+        marker.scale.z = 0.2;
+
+        marker.color.r = 1.0f;
+        marker.color.g = 0.0f;
+        marker.color.b = 0.0f;
+        marker.color.a = 1.0f;
+
+        marker.lifetime = rclcpp::Duration::from_seconds(0.2);
+
+        marker_publisher_->publish(marker);
     }
 
     void lidar_callback(const sensor_msgs::msg::LaserScan::ConstSharedPtr scan_msg)
@@ -269,14 +371,17 @@ class ReactiveFollowGap : public rclcpp::Node
         try
         {
             // Store scan parameters for use in other functions
-            angle_increment_ = scan_msg->angle_increment;
-            ranges_size_ = scan_msg->ranges.size();
-
+            angle_increment_ = scan_msg->angle_increment;       // 측정치들간의 각도 간격 (단위 : radian)
+            ranges_size_ = scan_msg->ranges.size();             // 측정치의 개수
+            // std::cout << "Ranges size: " << ranges_size_ << std::endl;  // Simulation 상에서는 1080개라고 함.
             // Create mutable copy of ranges for processing
             std::vector<float> ranges_vec = scan_msg->ranges;
             float *ranges = ranges_vec.data();
 
             // Preprocess LiDAR data (includes bubble elimination around closest point)
+            // What is bubble elimination?
+            // Bubble elimination is setting points within a certain distance of the closest obstacle to zero.
+            // This helps to avoid collisions by ignoring nearby obstacles.
             preprocess_lidar(ranges);
 
             // Find the largest gap
@@ -287,6 +392,10 @@ class ReactiveFollowGap : public rclcpp::Node
             find_best_point(ranges, gap_indices);
 
             size_t best_point_idx = static_cast<size_t>(gap_indices[2]);
+            std::cout << "Best point index: " << best_point_idx << std::endl;
+
+            // RViz에 best_point marker publish
+            publish_best_point_marker(best_point_idx, ranges);
 
             // Calculate control commands
             auto [steering_angle, drive_speed] = vehicle_control(ranges, best_point_idx);
