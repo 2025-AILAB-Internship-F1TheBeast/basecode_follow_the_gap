@@ -8,8 +8,14 @@
 #include <optional>
 #include <string>
 #include <vector>
+#include <signal.h>
+#include <memory>
 
 /// CHECK: include needed ROS msg type headers and libraries
+
+// Forward declaration
+class ReactiveFollowGap;
+
 class ReactiveFollowGap : public rclcpp::Node
 {
     // Implement Reactive Follow Gap on the car
@@ -24,6 +30,15 @@ class ReactiveFollowGap : public rclcpp::Node
             lidarscan_topic, 10, std::bind(&ReactiveFollowGap::lidar_callback, this, std::placeholders::_1));
 
         RCLCPP_INFO(this->get_logger(), "ReactiveFollowGap node initialized");
+    }
+
+    void stop_vehicle()
+    {
+        auto drive_msg = ackermann_msgs::msg::AckermannDriveStamped();
+        drive_msg.drive.steering_angle = 0.0;
+        drive_msg.drive.speed = 0.0;
+        drive_publisher_->publish(drive_msg);
+        RCLCPP_INFO(this->get_logger(), "Vehicle stopped safely");
     }
 
   private:
@@ -305,10 +320,46 @@ class ReactiveFollowGap : public rclcpp::Node
     }
 };
 
+// Global variables for signal handling
+std::shared_ptr<ReactiveFollowGap> g_node = nullptr;
+volatile sig_atomic_t g_signal_received = 0;
+
+// Signal handler function
+void signal_handler(int signal)
+{
+    g_signal_received = signal;
+    if (g_node != nullptr)
+    {
+        g_node->stop_vehicle();
+        RCLCPP_INFO(g_node->get_logger(), "Received signal %d, stopping vehicle and shutting down...", signal);
+    }
+    rclcpp::shutdown();
+}
+
 int main(int argc, char **argv)
 {
     rclcpp::init(argc, argv);
-    rclcpp::spin(std::make_shared<ReactiveFollowGap>());
+    
+    // Register signal handlers for graceful shutdown
+    signal(SIGINT, signal_handler);   // Ctrl+C
+    signal(SIGTERM, signal_handler);  // Termination request
+    
+    // Create node and store globally for signal handler access
+    g_node = std::make_shared<ReactiveFollowGap>();
+    
+    RCLCPP_INFO(g_node->get_logger(), "Press Ctrl+C to stop the vehicle and exit safely");
+    
+    try {
+        rclcpp::spin(g_node);
+    } catch (const std::exception& e) {
+        RCLCPP_ERROR(g_node->get_logger(), "Exception during execution: %s", e.what());
+    }
+    
+    // Clean shutdown
+    if (g_node != nullptr) {
+        g_node->stop_vehicle();
+    }
+    
     rclcpp::shutdown();
     return 0;
 }
